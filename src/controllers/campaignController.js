@@ -249,4 +249,23 @@ const deleteCampaign = async (req, res) => {
   }
 };
 
-module.exports = { getCampaigns, getCampaign, createCampaign, launchCampaign, cancelCampaign, deleteCampaign, processCampaignJob };
+// ─── Estimate audience size for campaign wizard ────────────────────────────
+const estimateCampaign = async (req, res) => {
+  try {
+    const { audience = {} } = req.body;
+    const query = { tenantId: req.tenantId, optedOut: { $ne: true }, blocked: { $ne: true } };
+
+    if (audience.type === 'hot')   query.status = 'hot';
+    if (audience.type === 'warm')  query.status = 'warm';
+    if (audience.type === 'cold')  query.status = 'cold';
+    if (audience.type === 'optin') query.optedIn = true;
+    if (audience.type === 'tag' && audience.tags?.length) query.tags = { $in: audience.tags };
+
+    const count = await Contact.countDocuments(query);
+    res.json({ count });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+module.exports = { getCampaigns, getCampaign, createCampaign, launchCampaign, cancelCampaign, deleteCampaign, processCampaignJob, estimateCampaign };

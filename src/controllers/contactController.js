@@ -265,4 +265,14 @@ const eraseContact = async (req, res) => {
   }
 };
 
-module.exports = { getContacts, createContact, updateContact, deleteContact, importContacts, exportContacts, getOptedOut, eraseContact };
+// ─── Get all unique tags for tenant ───────────────────────────────────────
+const getTags = async (req, res) => {
+  try {
+    const tags = await Contact.distinct('tags', { tenantId: req.tenantId });
+    res.json({ tags: tags.filter(Boolean).sort() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+module.exports = { getContacts, createContact, updateContact, deleteContact, importContacts, exportContacts, getOptedOut, eraseContact, getTags };

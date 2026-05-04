@@ -139,4 +139,111 @@ const assignConversation = async (req, res) => {
   }
 };
 
-module.exports = { getMessages, getConversations, sendMessage, assignConversation };
+// Add internal note to a conversation
+const addNote = async (req, res) => {
+  try {
+    const { contactId } = req.params;
+    const { text } = req.body;
+    if (!text?.trim()) return res.status(400).json({ error: 'Note text is required' });
+
+    const contact = await Contact.findOne({ _id: contactId, tenantId: req.tenantId });
+    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+
+    const note = await Message.create({
+      tenantId: req.tenantId,
+      contactId,
+      direction: 'outbound',
+      type: 'text',
+      content: { text, isNote: true },
+      status: 'read',
+      sentBy: req.user._id,
+    });
+
+    // Emit to socket room
+    const io = req.app.get('io');
+    if (io) io.to(req.tenantId.toString()).emit('new_message', { conversationId: contactId, message: note });
+
+    res.status(201).json({ message: note });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// Update conversation status: open / snoozed / resolved
+const updateConversationStatus = async (req, res) => {
+  try {
+    const { contactId } = req.params;
+    const { status } = req.body;
+    const allowed = ['open', 'snoozed', 'resolved'];
+    if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` });
+
+    const contact = await Contact.findOneAndUpdate(
+      { _id: contactId, tenantId: req.tenantId },
+      { conversationStatus: status, updatedAt: new Date() },
+      { new: true }
+    );
+    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+
+    const io = req.app.get('io');
+    if (io) io.to(req.tenantId.toString()).emit('conversation_update', { conversationId: contactId, status });
+
+    res.json({ contact });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// Mark conversation as read (clears unread count)
+const markConversationRead = async (req, res) => {
+  try {
+    const { contactId } = req.params;
+    await Message.updateMany(
+      { tenantId: req.tenantId, contactId, direction: 'inbound', status: { $ne: 'read' } },
+      { $set: { status: 'read' } }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// Context drawer: contact details + recent orders for right panel
+const getConversationContext = async (req, res) => {
+  try {
+    const { contactId } = req.params;
+    const contact = await Contact.findOne({ _id: contactId, tenantId: req.tenantId })
+      .populate('assignedTo', 'name email');
+    if (!contact) return res.status(404).json({ error: 'Contact not found' });
+
+    // Count messages and get first/last
+    const [messageCount, firstMsg, lastMsg] = await Promise.all([
+      Message.countDocuments({ tenantId: req.tenantId, contactId }),
+      Message.findOne({ tenantId: req.tenantId, contactId }).sort({ createdAt: 1 }).select('createdAt'),
+      Message.findOne({ tenantId: req.tenantId, contactId }).sort({ createdAt: -1 }).select('createdAt'),
+    ]);
+
+    res.json({
+      contact: {
+        _id: contact._id,
+        name: contact.name,
+        phone: contact.phone,
+        email: contact.email,
+        tags: contact.tags || [],
+        status: contact.status,
+        notes: contact.notes,
+        optedOut: contact.optedOut,
+        assignedTo: contact.assignedTo,
+        customFields: contact.customFields,
+        createdAt: contact.createdAt,
+        lastContactedAt: contact.lastContactedAt || lastMsg?.createdAt,
+        firstSeen: firstMsg?.createdAt,
+        messageCount,
+      },
+      recentOrders: [], // placeholder — populate from Shopify/WooCommerce when integrated
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+module.exports = { getMessages, getConversations, sendMessage, assignConversation, addNote, updateConversationStatus, markConversationRead, getConversationContext };

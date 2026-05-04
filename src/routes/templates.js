@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { getTemplates, createTemplate, deleteTemplate, syncTemplates, validateTemplateEndpoint } = require('../controllers/templateController');
+const { getTemplates, createTemplate, updateTemplate, deleteTemplate, syncTemplates, validateTemplateEndpoint } = require('../controllers/templateController');
 const { protect, requireRole } = require('../middleware/auth');
 const { requireTenant } = require('../middleware/tenant');
 
@@ -13,6 +13,7 @@ router.get('/',         readRoles, getTemplates);
 router.post('/validate', writeRoles, validateTemplateEndpoint);
 router.post('/',        writeRoles, createTemplate);
 router.post('/sync',    writeRoles, syncTemplates);
+router.put('/:id',     writeRoles, updateTemplate);
 router.delete('/:id',  writeRoles, deleteTemplate);
 
 module.exports = router;

@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const {
-  getCampaigns, getCampaign, createCampaign, launchCampaign, cancelCampaign, deleteCampaign,
+  getCampaigns, getCampaign, createCampaign, launchCampaign, cancelCampaign, deleteCampaign, estimateCampaign,
 } = require('../controllers/campaignController');
 const { protect, requireRole } = require('../middleware/auth');
 const { requireTenant } = require('../middleware/tenant');
@@ -12,6 +12,7 @@ router.use(protect, requireTenant);
 const campaignRoles = requireRole('owner', 'manager', 'campaign_manager');
 
 router.get('/',            campaignRoles, getCampaigns);
+router.post('/estimate',   campaignRoles, estimateCampaign);
 router.post('/',           campaignRoles, validate(schemas.createCampaign), createCampaign);
 router.get('/:id',         campaignRoles, getCampaign);
 router.post('/:id/launch', campaignRoles, launchCampaign);

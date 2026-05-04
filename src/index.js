@@ -27,6 +27,7 @@ const chatbotFlowRoutes = require('./routes/chatbotFlows');
 const quickReplyRoutes  = require('./routes/quickReplies');
 const notificationRoutes = require('./routes/notifications');
 const sdkRoutes          = require('./routes/sdk');
+const leadRoutes         = require('./routes/leads');
 
 const app    = express();
 const server = http.createServer(app);
@@ -104,6 +105,7 @@ app.use('/api/chatbot-flows',  chatbotFlowRoutes);
 app.use('/api/quick-replies',  quickReplyRoutes);
 app.use('/api/notifications',  notificationRoutes);
 app.use('/api/sdk',            sdkRoutes);
+app.use('/api/leads',          leadRoutes);
 
 // ─── Health check ──────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'NitiGrow API', timestamp: new Date() }));

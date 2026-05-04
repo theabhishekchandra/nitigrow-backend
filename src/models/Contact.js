@@ -7,12 +7,15 @@ const contactSchema = new mongoose.Schema({
   email:           { type: String },
   tags:            [{ type: String }],
   status:          { type: String, enum: ['hot', 'warm', 'cold', 'customer'], default: 'warm' },
+  conversationStatus: { type: String, enum: ['open', 'snoozed', 'resolved'], default: 'open' },
   customFields:    { type: Map, of: String },
   optedIn:         { type: Boolean, default: false },
   optInSource:     { type: String },
   optInDate:       { type: Date },
   optedOut:        { type: Boolean, default: false },
   optOutDate:      { type: Date },
+
+  channel:         { type: String, enum: ['whatsapp', 'instagram', 'email'], default: 'whatsapp' },
 
   // WhatsApp 24h messaging window tracking
   windowExpiresAt: { type: Date },
