@@ -31,7 +31,7 @@ router.post('/summarize/:contactId', requireLimit('ai'), async (req, res) => {
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
     const response = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: 'claude-haiku-4-5',
       max_tokens: 256,
       messages: [{
         role: 'user',
@@ -55,7 +55,7 @@ router.post('/classify-intent', requireLimit('ai'), async (req, res) => {
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
     const response = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: 'claude-haiku-4-5',
       max_tokens: 64,
       messages: [{
         role: 'user',
