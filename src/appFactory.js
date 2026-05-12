@@ -174,7 +174,25 @@ const createApp = ({ enableMorgan = true, enableSocketIo = true } = {}) => {
     sanitizeMongo(req.params);
     next();
   });
-  app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
+  // SDK endpoints are reached from arbitrary customer origins (whatever the
+  // tenant registers in ApiKey.allowedDomains). The browser-visible CORS gate
+  // is intentionally permissive for /api/sdk/* — `sdkKeyAuth` validates the
+  // Origin header against the per-key allow-list downstream. Everything else
+  // remains tight to the dashboard/admin/landing origins.
+  app.use(
+    cors((req, callback) => {
+      if (req.path.startsWith('/api/sdk')) {
+        return callback(null, {
+          origin: true,
+          credentials: false,
+          methods: ['GET', 'POST', 'OPTIONS'],
+          allowedHeaders: ['Content-Type', 'X-Nitigrow-Key', 'X-Api-Key'],
+          maxAge: 600,
+        });
+      }
+      return callback(null, { origin: ALLOWED_ORIGINS, credentials: true });
+    }),
+  );
   app.use(cookieParser());
   app.use(express.json({ limit: '10mb' }));
   // Morgan is now superseded by pino-http; keep behind flag for dev-only verbose output.
