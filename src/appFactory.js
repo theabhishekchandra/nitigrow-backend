@@ -56,8 +56,17 @@ const createApp = ({ enableMorgan = true, enableSocketIo = true } = {}) => {
 
   let io = null;
   if (enableSocketIo) {
+    // Socket.io CORS: the dashboard/admin origins are tight, but the SDK
+    // widget connects from arbitrary customer sites (whatever's in their
+    // ApiKey.allowedDomains). Security for SDK connections lives at the
+    // application layer — the session token is required to join any
+    // session room. Server-side we accept all origins for the upgrade and
+    // gate access via `join_sdk_session`.
     io = new Server(server, {
-      cors: { origin: ALLOWED_ORIGINS, credentials: true },
+      cors: {
+        origin: (origin, cb) => cb(null, ALLOWED_ORIGINS.includes(origin) ? origin : true),
+        credentials: true,
+      },
     });
     global.io = io;
 
@@ -82,6 +91,46 @@ const createApp = ({ enableMorgan = true, enableSocketIo = true } = {}) => {
           if (decoded.type === 'admin') socket.join('admins');
         } catch {
           // ignore — admin will fall back to the 60s poll in Layout
+        }
+      });
+
+      // SDK widget joins `sdk:<sessionId>` room after presenting its
+      // session token. Server-side hashes the token and looks up the
+      // ChatSession so the room name itself doesn't reveal the secret.
+      // Inline-required so the model only loads if sockets are enabled.
+      socket.on('join_sdk_session', async (sessionToken) => {
+        try {
+          if (typeof sessionToken !== 'string' || sessionToken.length !== 64) return;
+          const ChatSession = require('./models/ChatSession');
+          const hash = ChatSession.hashToken(sessionToken);
+          const session = await ChatSession.findOne({ sessionTokenHash: hash })
+            .select('_id status')
+            .lean();
+          if (!session || session.status === 'closed') return;
+          socket.join(`sdk:${session._id}`);
+          // Echo back so the widget can flip from "connecting…" to "ready".
+          socket.emit('sdk:joined', { sessionId: String(session._id) });
+        } catch {
+          // ignore — widget falls back to REST polling for messages
+        }
+      });
+
+      // Visitor typing indicator — fire-and-forget broadcast to the
+      // tenant inbox room so the agent's UI can show a live blip.
+      socket.on('sdk:visitor_typing', async (sessionToken) => {
+        try {
+          if (typeof sessionToken !== 'string' || sessionToken.length !== 64) return;
+          const ChatSession = require('./models/ChatSession');
+          const hash = ChatSession.hashToken(sessionToken);
+          const session = await ChatSession.findOne({ sessionTokenHash: hash })
+            .select('_id tenantId contactId status')
+            .lean();
+          if (!session || session.status === 'closed') return;
+          io.to(`tenant-${session.tenantId}`).emit('contact_typing', {
+            contactId: String(session.contactId),
+          });
+        } catch {
+          /* swallow */
         }
       });
     });

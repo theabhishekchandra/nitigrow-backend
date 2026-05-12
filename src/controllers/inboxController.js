@@ -1,7 +1,15 @@
 const Message = require('../models/Message');
 const Contact = require('../models/Contact');
 const Tenant = require('../models/Tenant');
-const { sendText, sendImage, sendDocument, sendTemplate, sendButtons, saveAndEmit } = require('../services/whatsapp');
+const ChatSession = require('../models/ChatSession');
+const {
+  sendText,
+  sendImage,
+  sendDocument,
+  sendTemplate,
+  sendButtons,
+  saveAndEmit,
+} = require('../services/whatsapp');
 const { trackUsage } = require('../middleware/usageLimit');
 
 // Get conversation thread for a contact
@@ -31,13 +39,14 @@ const getConversations = async (req, res) => {
 
     const contactQuery = { tenantId: req.tenantId };
     if (status) contactQuery.status = status;
-    if (search) contactQuery.$or = [
-      { name: { $regex: search, $options: 'i' } },
-      { phone: { $regex: search, $options: 'i' } },
-    ];
+    if (search)
+      contactQuery.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } },
+      ];
 
     const contacts = await Contact.find(contactQuery).sort({ updatedAt: -1 }).limit(100);
-    const contactIds = contacts.map(c => c._id);
+    const contactIds = contacts.map((c) => c._id);
 
     // Mongoose's $match does NOT auto-cast strings to ObjectIds the way find() does.
     // tenantId from the JWT is a string; cast explicitly or this returns zero matches.
@@ -46,7 +55,21 @@ const getConversations = async (req, res) => {
     const latestMessages = await Message.aggregate([
       { $match: { tenantId: tenantOid, contactId: { $in: contactIds } } },
       { $sort: { createdAt: -1 } },
-      { $group: { _id: '$contactId', message: { $first: '$$ROOT' }, unreadCount: { $sum: { $cond: [{ $and: [{ $eq: ['$direction', 'inbound'] }, { $ne: ['$status', 'read'] }] }, 1, 0] } } } },
+      {
+        $group: {
+          _id: '$contactId',
+          message: { $first: '$$ROOT' },
+          unreadCount: {
+            $sum: {
+              $cond: [
+                { $and: [{ $eq: ['$direction', 'inbound'] }, { $ne: ['$status', 'read'] }] },
+                1,
+                0,
+              ],
+            },
+          },
+        },
+      },
     ]);
 
     const messageMap = {};
@@ -56,7 +79,7 @@ const getConversations = async (req, res) => {
       unreadMap[_id.toString()] = unreadCount;
     });
 
-    const conversations = contacts.map(c => ({
+    const conversations = contacts.map((c) => ({
       contactId: c,
       lastMessage: messageMap[c._id.toString()] || null,
       unreadCount: unreadMap[c._id.toString()] || 0,
@@ -71,7 +94,20 @@ const getConversations = async (req, res) => {
 // Send a message from inbox — route: POST /api/messages/send
 const sendMessage = async (req, res) => {
   try {
-    const { contactId, type = 'text', text, imageUrl, caption, docUrl, filename, templateName, language, components, buttons, content } = req.body;
+    const {
+      contactId,
+      type = 'text',
+      text,
+      imageUrl,
+      caption,
+      docUrl,
+      filename,
+      templateName,
+      language,
+      components,
+      buttons,
+      content,
+    } = req.body;
 
     if (!contactId) return res.status(400).json({ error: 'contactId is required' });
 
@@ -79,13 +115,57 @@ const sendMessage = async (req, res) => {
     if (!contact) return res.status(404).json({ error: 'Contact not found' });
 
     // req.tenant available from requireLimit middleware
-    const tenant = req.tenant || await Tenant.findById(req.tenantId);
-
-    let waResponse;
-    let msgContent = {};
+    const tenant = req.tenant || (await Tenant.findById(req.tenantId));
 
     // Support quick text shorthand from frontend: { contactId, content }
     const resolvedText = text || content;
+
+    // SDK-widget contacts don't have a real WhatsApp number — replies go
+    // back over the SDK socket room, not the Cloud API. Short-circuit
+    // before the switch so we never try to call sendText() on a
+    // synthetic `sdk:…` phone.
+    if (contact.channel === 'sdk_widget') {
+      if (type !== 'text') {
+        return res.status(400).json({ error: 'Only text replies supported for SDK chats' });
+      }
+      const message = await Message.create({
+        tenantId: req.tenantId,
+        contactId,
+        direction: 'outbound',
+        type: 'text',
+        content: { text: resolvedText },
+        status: 'sent',
+        sentBy: req.user._id,
+      });
+
+      // Find the most recent active session for this contact and push
+      // the agent message to the visitor's widget room.
+      const session = await ChatSession.findOne({
+        tenantId: req.tenantId,
+        contactId,
+        status: 'active',
+      }).sort({ lastActivityAt: -1 });
+
+      if (global.io) {
+        global.io.to(`tenant-${req.tenantId}`).emit('new_message', {
+          conversationId: String(contactId),
+          message,
+        });
+        if (session) {
+          global.io.to(`sdk:${session._id}`).emit('sdk:agent_message', {
+            id: String(message._id),
+            from: 'agent',
+            text: resolvedText,
+            agentName: req.user?.name || 'Agent',
+            createdAt: message.createdAt,
+          });
+        }
+      }
+      return res.status(201).json({ message, deliveredToWidget: !!session });
+    }
+
+    let waResponse;
+    let msgContent = {};
 
     switch (type) {
       case 'text':
@@ -101,7 +181,13 @@ const sendMessage = async (req, res) => {
         msgContent = { docUrl, filename };
         break;
       case 'template':
-        waResponse = await sendTemplate(req.tenantId, contact.phone, templateName, language, components);
+        waResponse = await sendTemplate(
+          req.tenantId,
+          contact.phone,
+          templateName,
+          language,
+          components,
+        );
         msgContent = { templateName, language, components };
         break;
       case 'buttons':
@@ -113,7 +199,14 @@ const sendMessage = async (req, res) => {
     }
 
     const waMessageId = waResponse?.messages?.[0]?.id;
-    const message = await saveAndEmit(req.tenantId, contactId, type, msgContent, waMessageId, req.user._id);
+    const message = await saveAndEmit(
+      req.tenantId,
+      contactId,
+      type,
+      msgContent,
+      waMessageId,
+      req.user._id,
+    );
 
     // Track monthly message usage (non-blocking)
     if (tenant) trackUsage(tenant, 'messages', 1).catch(() => {});
@@ -133,7 +226,7 @@ const assignConversation = async (req, res) => {
     const contact = await Contact.findOneAndUpdate(
       { _id: contactId, tenantId: req.tenantId },
       { assignedTo },
-      { new: true }
+      { new: true },
     );
     if (!contact) return res.status(404).json({ error: 'Contact not found' });
 
@@ -165,7 +258,11 @@ const addNote = async (req, res) => {
 
     // Emit to socket room
     const io = req.app.get('io');
-    if (io) io.to(req.tenantId.toString()).emit('new_message', { conversationId: contactId, message: note });
+    if (io)
+      io.to(req.tenantId.toString()).emit('new_message', {
+        conversationId: contactId,
+        message: note,
+      });
 
     res.status(201).json({ message: note });
   } catch (err) {
@@ -179,17 +276,22 @@ const updateConversationStatus = async (req, res) => {
     const { contactId } = req.params;
     const { status } = req.body;
     const allowed = ['open', 'snoozed', 'resolved'];
-    if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` });
+    if (!allowed.includes(status))
+      return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` });
 
     const contact = await Contact.findOneAndUpdate(
       { _id: contactId, tenantId: req.tenantId },
       { conversationStatus: status, updatedAt: new Date() },
-      { new: true }
+      { new: true },
     );
     if (!contact) return res.status(404).json({ error: 'Contact not found' });
 
     const io = req.app.get('io');
-    if (io) io.to(req.tenantId.toString()).emit('conversation_update', { conversationId: contactId, status });
+    if (io)
+      io.to(req.tenantId.toString()).emit('conversation_update', {
+        conversationId: contactId,
+        status,
+      });
 
     res.json({ contact });
   } catch (err) {
@@ -203,7 +305,7 @@ const markConversationRead = async (req, res) => {
     const { contactId } = req.params;
     await Message.updateMany(
       { tenantId: req.tenantId, contactId, direction: 'inbound', status: { $ne: 'read' } },
-      { $set: { status: 'read' } }
+      { $set: { status: 'read' } },
     );
     res.json({ ok: true });
   } catch (err) {
@@ -215,15 +317,21 @@ const markConversationRead = async (req, res) => {
 const getConversationContext = async (req, res) => {
   try {
     const { contactId } = req.params;
-    const contact = await Contact.findOne({ _id: contactId, tenantId: req.tenantId })
-      .populate('assignedTo', 'name email');
+    const contact = await Contact.findOne({ _id: contactId, tenantId: req.tenantId }).populate(
+      'assignedTo',
+      'name email',
+    );
     if (!contact) return res.status(404).json({ error: 'Contact not found' });
 
     // Count messages and get first/last
     const [messageCount, firstMsg, lastMsg] = await Promise.all([
       Message.countDocuments({ tenantId: req.tenantId, contactId }),
-      Message.findOne({ tenantId: req.tenantId, contactId }).sort({ createdAt: 1 }).select('createdAt'),
-      Message.findOne({ tenantId: req.tenantId, contactId }).sort({ createdAt: -1 }).select('createdAt'),
+      Message.findOne({ tenantId: req.tenantId, contactId })
+        .sort({ createdAt: 1 })
+        .select('createdAt'),
+      Message.findOne({ tenantId: req.tenantId, contactId })
+        .sort({ createdAt: -1 })
+        .select('createdAt'),
     ]);
 
     res.json({
@@ -250,4 +358,13 @@ const getConversationContext = async (req, res) => {
   }
 };
 
-module.exports = { getMessages, getConversations, sendMessage, assignConversation, addNote, updateConversationStatus, markConversationRead, getConversationContext };
+module.exports = {
+  getMessages,
+  getConversations,
+  sendMessage,
+  assignConversation,
+  addNote,
+  updateConversationStatus,
+  markConversationRead,
+  getConversationContext,
+};
