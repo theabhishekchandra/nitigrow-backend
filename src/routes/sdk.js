@@ -1,35 +1,47 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
-const Tenant = require('../models/Tenant');
 
-/**
- * GET /api/sdk/init
- * Loads the widget configuration for a specific API key.
- * Used by the embeddable script to customize colors, business name, etc.
- */
-router.get('/init', async (req, res) => {
-  try {
-    const { apiKey } = req.query;
-    if (!apiKey) return res.status(400).json({ error: 'apikey_required' });
+const { requireSdkKey } = require('../middleware/sdkKeyAuth');
+const {
+  startSession,
+  sendMessage,
+  getHistory,
+  closeSession,
+} = require('../controllers/sdkChatController');
 
-    // TODO: Implement actual API Key lookup on Tenant model
-    // For now, find by businessName (simulating key lookup)
-    const tenant = await Tenant.findOne({ status: 'active' }); 
-    
-    if (!tenant) return res.status(404).json({ error: 'tenant_not_found' });
-
-    res.json({
-      businessName: tenant.businessName,
-      themeColor: '#25D366', // Default NitiGrow green
-      welcomeMessage: 'Hi! How can we help you?',
-      features: {
-        voice: true,
-        media: true
-      }
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// Per-key rate limiter. `max` comes from the key doc when available, else a
+// conservative default. The key resolution happens in requireSdkKey, so by
+// the time we hit this middleware req.sdkKey is populated.
+const sdkRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: (req) => req.sdkKey?.rateLimit || 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.sdkKey ? String(req.sdkKey._id) : req.ip),
+  skip: () => process.env.NODE_ENV === 'test',
+  message: { error: 'Rate limit exceeded for this API key' },
 });
+
+// Burst limiter on chat/start specifically — opens new sessions, which is
+// the resource-heavy path. Per-IP so a single attacker spinning up sessions
+// is contained, separately from the per-key limit above.
+const startBurst = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+  skip: () => process.env.NODE_ENV === 'test',
+  message: { error: 'Too many sessions started from this IP' },
+});
+
+router.use(requireSdkKey);
+router.use(sdkRateLimit);
+
+router.post('/chat/start', startBurst, startSession);
+router.post('/chat/message', sendMessage);
+router.get('/chat/history', getHistory);
+router.post('/chat/close', closeSession);
 
 module.exports = router;
