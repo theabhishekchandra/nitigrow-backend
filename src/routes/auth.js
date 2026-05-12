@@ -4,13 +4,18 @@ const { register, login, refreshToken, logout } = require('../controllers/authCo
 const { validate, schemas } = require('../middleware/validate');
 const { protect } = require('../middleware/auth');
 const { getPermissionsForRole, getSidebarForRole } = require('../config/permissions');
+const { csrfMiddleware, getCsrfToken } = require('../lib/csrf');
 const User = require('../models/User');
 const Tenant = require('../models/Tenant');
 
+// Hands the frontend a fresh CSRF token + sets the matching cookie.
+router.get('/csrf', getCsrfToken);
+
 router.post('/register', validate(schemas.register), register);
-router.post('/login',    validate(schemas.login), login);
-router.post('/refresh',  refreshToken);
-router.post('/logout',   logout);
+router.post('/login', validate(schemas.login), login);
+// /refresh and /logout are cookie-authenticated → CSRF-protected.
+router.post('/refresh', csrfMiddleware, refreshToken);
+router.post('/logout', csrfMiddleware, logout);
 
 // Hydrates the current session — used by web/mobile on launch to verify the JWT
 // is still valid and to pull the latest user + tenant snapshot.
