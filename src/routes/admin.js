@@ -8,6 +8,7 @@ const {
   changePassword, updateProfile,
   getPreferences, updatePreferences,
   listSessions, revokeSession, revokeAllOtherSessions,
+  getAuditLog,
 } = require('../controllers/adminController');
 const twofa = require('../controllers/admin2faController');
 const { adminProtect } = require('../middleware/adminAuth');
@@ -41,6 +42,7 @@ router.get('/users', getUsers);
 
 router.get('/billing', getBilling);
 router.get('/system',  getSystemHealth);
+router.get('/audit',   getAuditLog);
 
 // --- Self-service account routes ---
 router.patch('/password', auditLog('admin.password.change'), changePassword);

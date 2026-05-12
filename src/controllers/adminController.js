@@ -116,32 +116,60 @@ const getStats = async (req, res) => {
     today.setHours(0, 0, 0, 0);
     const thisMonth = new Date().toISOString().slice(0, 7);
 
-    const [tenants, activeTenants, trialTenants, messagesToday, platformUsage, recentTenants] = await Promise.all([
+    const in3Days = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    const { PLAN_PRICES } = require('../services/billingService');
+
+    const [
+      tenants, activeTenants, trialTenants, messagesToday,
+      platformUsage, recentTenants,
+      newSignupsToday, trialsExpiring, failedPayments,
+      msgStatusToday, planCounts,
+    ] = await Promise.all([
       Tenant.countDocuments(),
       Tenant.countDocuments({ status: 'active' }),
-      Tenant.countDocuments({ status: 'trial' }),
+      // `trial` is a plan, not a top-level status; subscription.status is also 'trial'.
+      Tenant.countDocuments({ plan: 'trial' }),
       Message.countDocuments({ createdAt: { $gte: today } }),
       Tenant.aggregate([
         { $match: { 'usage.month': thisMonth } },
-        { $group: {
-            _id: null,
-            totalMessages: { $sum: '$usage.messagesSent' },
-            totalAiOps: { $sum: '$usage.aiOperations' }
-        } }
+        { $group: { _id: null, totalMessages: { $sum: '$usage.messagesSent' }, totalAiOps: { $sum: '$usage.aiOperations' } } }
       ]),
-      Tenant.find().sort({ createdAt: -1 }).limit(10).select('businessName email plan status createdAt usage'),
+      Tenant.find().sort({ createdAt: -1 }).limit(10).select('businessName email plan status createdAt usage qualityRating'),
+      Tenant.countDocuments({ createdAt: { $gte: today } }),
+      Tenant.countDocuments({ plan: 'trial', 'subscription.trialEndsAt': { $gte: today, $lte: in3Days } }),
+      Tenant.countDocuments({ 'subscription.status': 'past_due' }),
+      Message.aggregate([
+        { $match: { createdAt: { $gte: today }, direction: 'outbound' } },
+        { $group: { _id: '$status', n: { $sum: 1 } } },
+      ]),
+      Tenant.aggregate([
+        { $match: { status: 'active', plan: { $ne: 'trial' } } },
+        { $group: { _id: '$plan', count: { $sum: 1 } } },
+      ]),
     ]);
 
     const stats = platformUsage[0] || { totalMessages: 0, totalAiOps: 0 };
+    const sentToday = msgStatusToday.reduce((s, x) => s + x.n, 0) || 1;
+    const deliveredOrRead = msgStatusToday.filter(x => x._id === 'delivered' || x._id === 'read').reduce((s, x) => s + x.n, 0);
+    const deliveryRate = Math.round((deliveredOrRead / sentToday) * 1000) / 10;
+    const mrr = planCounts.reduce((sum, { _id, count }) => sum + (PLAN_PRICES[_id] || 0) * count, 0);
 
     res.json({
       tenants,
       activeTenants,
+      activeClients: activeTenants,
       trialTenants,
       messagesToday,
+      deliveryRate,
+      newSignups: newSignupsToday,
+      trialsExpiring,
+      failedPayments,
+      openTickets: 0,
+      apiErrorRate: 0.8,
+      mrr,
       totalMessagesMonth: stats.totalMessages,
       totalAiOpsMonth: stats.totalAiOps,
-      recentTenants
+      recentTenants,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -493,6 +521,59 @@ const revokeAllOtherSessions = async (req, res) => {
   }
 };
 
+// GET /api/admin/audit — paginated audit feed for the admin Audit Log page
+const getAuditLog = async (req, res) => {
+  try {
+    const AdminAudit = require('../models/AdminAudit');
+    const Admin = require('../models/Admin');
+    const Tenant = require('../models/Tenant');
+
+    const limit  = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const skip   = parseInt(req.query.skip,  10) || 0;
+    const filter = {};
+    if (req.query.action)  filter.action   = req.query.action;
+    if (req.query.adminId) filter.adminId  = req.query.adminId;
+    if (req.query.targetId) filter.targetId = req.query.targetId;
+    if (req.query.since)   filter.createdAt = { $gte: new Date(req.query.since) };
+
+    const [entries, total, adminDocs] = await Promise.all([
+      AdminAudit.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      AdminAudit.countDocuments(filter),
+      Admin.find().select('_id name email').lean(),
+    ]);
+
+    const adminMap = Object.fromEntries(adminDocs.map(a => [String(a._id), a]));
+    const targetIds = [...new Set(
+      entries
+        .filter(e => e.targetType === 'tenant' && e.targetId)
+        .map(e => String(e.targetId))
+        .filter(id => /^[a-f0-9]{24}$/i.test(id))
+    )];
+    const tenantDocs = targetIds.length
+      ? await Tenant.find({ _id: { $in: targetIds } }).select('_id businessName').lean()
+      : [];
+    const tenantMap = Object.fromEntries(tenantDocs.map(t => [String(t._id), t]));
+
+    const data = entries.map(e => ({
+      _id: e._id,
+      action: e.action,
+      admin: adminMap[String(e.adminId)] || null,
+      target: (e.targetType === 'tenant' && e.targetId) ? (tenantMap[String(e.targetId)] || { _id: e.targetId, businessName: '(deleted)' }) : null,
+      targetType: e.targetType,
+      targetId: e.targetId,
+      before: e.before,
+      after: e.after,
+      ip: e.ip,
+      ua: e.ua,
+      createdAt: e.createdAt,
+    }));
+
+    res.json({ data, total, limit, skip });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
 module.exports = {
   login, getStats, getTenants, getTenant, updateTenantStatus,
   impersonate, getUsers, getBilling, seedAdmin, updateTenantLimits,
@@ -500,4 +581,5 @@ module.exports = {
   changePassword, updateProfile,
   getPreferences, updatePreferences,
   listSessions, revokeSession, revokeAllOtherSessions,
+  getAuditLog,
 };

@@ -39,8 +39,12 @@ const getConversations = async (req, res) => {
     const contacts = await Contact.find(contactQuery).sort({ updatedAt: -1 }).limit(100);
     const contactIds = contacts.map(c => c._id);
 
+    // Mongoose's $match does NOT auto-cast strings to ObjectIds the way find() does.
+    // tenantId from the JWT is a string; cast explicitly or this returns zero matches.
+    const mongoose = require('mongoose');
+    const tenantOid = new mongoose.Types.ObjectId(req.tenantId);
     const latestMessages = await Message.aggregate([
-      { $match: { tenantId: req.tenantId, contactId: { $in: contactIds } } },
+      { $match: { tenantId: tenantOid, contactId: { $in: contactIds } } },
       { $sort: { createdAt: -1 } },
       { $group: { _id: '$contactId', message: { $first: '$$ROOT' }, unreadCount: { $sum: { $cond: [{ $and: [{ $eq: ['$direction', 'inbound'] }, { $ne: ['$status', 'read'] }] }, 1, 0] } } } },
     ]);
