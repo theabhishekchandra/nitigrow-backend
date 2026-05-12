@@ -13,6 +13,9 @@ const adminProtect = async (req, res, next) => {
     if (!admin || !admin.isActive) return res.status(401).json({ error: 'Admin account not found or inactive' });
 
     req.admin = admin;
+    // Surface decoded claims (incl. jti) for session-aware handlers.
+    // NOTE: We don't yet enforce jti ∈ admin.sessions[] here — follow-up if we want hard revoke.
+    req.user = { id: decoded.id, role: decoded.role, jti: decoded.jti };
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });

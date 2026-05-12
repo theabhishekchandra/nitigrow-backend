@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Admin = require('../models/Admin');
 const Tenant = require('../models/Tenant');
@@ -6,29 +8,102 @@ const Contact = require('../models/Contact');
 const Message = require('../models/Message');
 const Template = require('../models/Template');
 const Campaign = require('../models/Campaign');
+const { decrypt } = require('../services/encryption');
+const { verifyTotp } = require('./admin2faController');
+
+const LOCK_THRESHOLD = 5;
+const LOCK_DURATION_MS = 15 * 60 * 1000;
+
+const getClientIp = (req) => req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.connection?.remoteAddress;
 
 // POST /api/admin/login
 const login = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, code } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
     const admin = await Admin.findOne({ email });
-    if (!admin || !(await admin.matchPassword(password))) {
+    if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
+
+    // Locked? Reject before bcrypt compare to avoid timing-amplified brute force.
+    if (admin.lockedUntil && admin.lockedUntil > new Date()) {
+      const retryAfter = Math.ceil((admin.lockedUntil - Date.now()) / 1000);
+      res.set('Retry-After', String(retryAfter));
+      return res.status(423).json({ error: 'Account temporarily locked. Try again later.', retryAfter });
+    }
+
+    const passwordOk = await admin.matchPassword(password);
+    if (!passwordOk) {
+      admin.failedLoginCount = (admin.failedLoginCount || 0) + 1;
+      if (admin.failedLoginCount >= LOCK_THRESHOLD) {
+        admin.lockedUntil = new Date(Date.now() + LOCK_DURATION_MS);
+        admin.failedLoginCount = 0;
+      }
+      await admin.save();
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+
     if (!admin.isActive) return res.status(403).json({ error: 'Account inactive' });
 
+    // 2FA gate — if enabled and no code provided, hand back a short-lived partial token.
+    if (admin.twoFactorEnabled) {
+      if (!code) {
+        const partial = jwt.sign(
+          { id: admin._id, type: 'admin-2fa', stage: 'pending' },
+          process.env.JWT_SECRET,
+          { expiresIn: '5m' }
+        );
+        return res.json({ twoFactorRequired: true, partial });
+      }
+
+      let codeOk = false;
+      if (admin.totpSecret) {
+        try { codeOk = verifyTotp(decrypt(admin.totpSecret), code); } catch { codeOk = false; }
+      }
+      if (!codeOk && admin.recoveryCodes?.length) {
+        for (let i = 0; i < admin.recoveryCodes.length; i++) {
+          if (await bcrypt.compare(code, admin.recoveryCodes[i])) {
+            admin.recoveryCodes.splice(i, 1);
+            codeOk = true;
+            break;
+          }
+        }
+      }
+      if (!codeOk) return res.status(401).json({ error: 'Invalid 2FA code' });
+    }
+
+    // Success — issue session.
+    admin.failedLoginCount = 0;
+    admin.lockedUntil = null;
     admin.lastLoginAt = new Date();
+    admin.lastLoginIp = getClientIp(req);
+
+    const jti = crypto.randomBytes(16).toString('hex');
+    admin.sessions.push({
+      jti,
+      ip: admin.lastLoginIp,
+      ua: req.headers['user-agent'],
+      createdAt: new Date(),
+      lastSeenAt: new Date(),
+    });
     await admin.save();
 
     const accessToken = jwt.sign(
-      { id: admin._id, type: 'admin', role: admin.role },
+      { id: admin._id, type: 'admin', role: admin.role, jti },
       process.env.JWT_SECRET,
       { expiresIn: '8h' }
     );
 
-    res.json({ accessToken, user: { _id: admin._id, name: admin.name, email: admin.email, role: admin.role } });
+    res.json({
+      accessToken,
+      user: {
+        _id: admin._id,
+        name: admin.name,
+        email: admin.email,
+        role: admin.role,
+        twoFactorEnabled: admin.twoFactorEnabled,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -48,10 +123,10 @@ const getStats = async (req, res) => {
       Message.countDocuments({ createdAt: { $gte: today } }),
       Tenant.aggregate([
         { $match: { 'usage.month': thisMonth } },
-        { $group: { 
-            _id: null, 
-            totalMessages: { $sum: '$usage.messagesSent' }, 
-            totalAiOps: { $sum: '$usage.aiOperations' } 
+        { $group: {
+            _id: null,
+            totalMessages: { $sum: '$usage.messagesSent' },
+            totalAiOps: { $sum: '$usage.aiOperations' }
         } }
       ]),
       Tenant.find().sort({ createdAt: -1 }).limit(10).select('businessName email plan status createdAt usage'),
@@ -59,14 +134,14 @@ const getStats = async (req, res) => {
 
     const stats = platformUsage[0] || { totalMessages: 0, totalAiOps: 0 };
 
-    res.json({ 
-      tenants, 
-      activeTenants, 
-      trialTenants, 
-      messagesToday, 
+    res.json({
+      tenants,
+      activeTenants,
+      trialTenants,
+      messagesToday,
       totalMessagesMonth: stats.totalMessages,
       totalAiOpsMonth: stats.totalAiOps,
-      recentTenants 
+      recentTenants
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -283,8 +358,146 @@ const seedAdmin = async (req, res) => {
   }
 };
 
+// PATCH /api/admin/password
+const changePassword = async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'currentPassword and newPassword required' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+
+    const admin = await Admin.findById(req.admin._id);
+    if (!admin || !(await admin.matchPassword(currentPassword))) {
+      return res.status(401).json({ error: 'Current password incorrect' });
+    }
+
+    admin.password = newPassword; // pre-save hook hashes + sets passwordChangedAt
+    await admin.save();
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// PATCH /api/admin/profile  — email is intentionally read-only (prevents ownership swap).
+const updateProfile = async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Name required' });
+
+    const admin = await Admin.findByIdAndUpdate(
+      req.admin._id,
+      { $set: { name: name.trim() } },
+      { new: true }
+    ).select('-password -totpSecret -recoveryCodes -sessions');
+
+    res.json({
+      _id: admin._id,
+      name: admin.name,
+      email: admin.email,
+      role: admin.role,
+      twoFactorEnabled: admin.twoFactorEnabled,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/admin/preferences
+const getPreferences = async (req, res) => {
+  try {
+    const admin = await Admin.findById(req.admin._id).select('preferences');
+    res.json(admin?.preferences || { notifications: {} });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// PUT /api/admin/preferences  — full replace of preferences.notifications
+const ALLOWED_NOTIF_KEYS = ['newTicketUrgent', 'paymentFailed', 'qualityDropped', 'newSignup', 'weeklyDigest'];
+const updatePreferences = async (req, res) => {
+  try {
+    const { notifications } = req.body || {};
+    if (!notifications || typeof notifications !== 'object') {
+      return res.status(400).json({ error: 'notifications object required' });
+    }
+
+    const next = {};
+    for (const key of ALLOWED_NOTIF_KEYS) {
+      if (key in notifications) next[key] = Boolean(notifications[key]);
+    }
+
+    const admin = await Admin.findByIdAndUpdate(
+      req.admin._id,
+      { $set: { 'preferences.notifications': next } },
+      { new: true }
+    ).select('preferences');
+
+    res.json(admin.preferences);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/admin/sessions
+const listSessions = async (req, res) => {
+  try {
+    const admin = await Admin.findById(req.admin._id).select('sessions');
+    const currentJti = req.user?.jti;
+    const sessions = (admin?.sessions || []).map((s) => ({
+      jti: s.jti,
+      ip: s.ip,
+      ua: s.ua,
+      createdAt: s.createdAt,
+      lastSeenAt: s.lastSeenAt,
+      current: s.jti === currentJti,
+    }));
+    res.json(sessions);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// DELETE /api/admin/sessions/:jti
+const revokeSession = async (req, res) => {
+  try {
+    const { jti } = req.params;
+    if (!jti) return res.status(400).json({ error: 'jti required' });
+
+    await Admin.updateOne(
+      { _id: req.admin._id },
+      { $pull: { sessions: { jti } } }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// POST /api/admin/sessions/revoke-others — keep only current session
+const revokeAllOtherSessions = async (req, res) => {
+  try {
+    const currentJti = req.user?.jti;
+    const admin = await Admin.findById(req.admin._id);
+    if (!admin) return res.status(404).json({ error: 'Admin not found' });
+
+    admin.sessions = currentJti ? admin.sessions.filter((s) => s.jti === currentJti) : [];
+    await admin.save();
+    res.json({ success: true, remaining: admin.sessions.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
 module.exports = {
   login, getStats, getTenants, getTenant, updateTenantStatus,
   impersonate, getUsers, getBilling, seedAdmin, updateTenantLimits,
   getSystemHealth,
+  changePassword, updateProfile,
+  getPreferences, updatePreferences,
+  listSessions, revokeSession, revokeAllOtherSessions,
 };
