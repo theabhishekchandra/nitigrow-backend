@@ -37,6 +37,7 @@ const notificationRoutes = require('./routes/notifications');
 const sdkRoutes = require('./routes/sdk');
 const leadRoutes = require('./routes/leads');
 const onboardingRoutes = require('./routes/onboarding');
+const marketingContactRoutes = require('./routes/contact');
 
 // Builds the Express app + http server + socket.io. No side-effects — does not
 // connect to Mongo/Redis or bind a port. Callers (production index.js, tests)
@@ -48,6 +49,9 @@ const createApp = ({ enableMorgan = true, enableSocketIo = true } = {}) => {
   const ALLOWED_ORIGINS = [
     process.env.FRONTEND_URL || 'http://localhost:5173',
     process.env.ADMIN_URL || 'http://localhost:5174',
+    process.env.LANDING_URL || 'http://localhost:5180',
+    'https://nitigrow.in',
+    'https://www.nitigrow.in',
   ];
 
   let io = null;
@@ -162,6 +166,7 @@ const createApp = ({ enableMorgan = true, enableSocketIo = true } = {}) => {
   app.use('/api/sdk', sdkRoutes);
   app.use('/api/leads', leadRoutes);
   app.use('/api/onboarding', onboardingRoutes);
+  app.use('/api/contact', marketingContactRoutes); // public marketing form
 
   // Health (live/ready), Prometheus metrics, BullMQ dashboard (admin-JWT gated).
   app.use('/health', healthRoutes);

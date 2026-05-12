@@ -23,6 +23,10 @@ const {
   getAuditLog,
 } = require('../controllers/adminController');
 const twofa = require('../controllers/admin2faController');
+const {
+  listSubmissions: listContactSubmissions,
+  updateSubmission: updateContactSubmission,
+} = require('../controllers/marketingContactController');
 const { adminProtect } = require('../middleware/adminAuth');
 const { ipAllowlist } = require('../middleware/ipAllowlist');
 const { auditLog } = require('../middleware/adminAudit');
@@ -65,6 +69,10 @@ router.get('/users', getUsers);
 router.get('/billing', getBilling);
 router.get('/system', getSystemHealth);
 router.get('/audit', getAuditLog);
+
+// Landing-page lead inbox — `/api/contact` writes here; admins triage from this list.
+router.get('/contact-submissions', listContactSubmissions);
+router.patch('/contact-submissions/:id', auditLog('lead.update'), updateContactSubmission);
 
 // --- Self-service account routes ---
 router.patch('/password', auditLog('admin.password.change'), changePassword);
