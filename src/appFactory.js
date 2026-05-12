@@ -71,6 +71,19 @@ const createApp = ({ enableMorgan = true, enableSocketIo = true } = {}) => {
           socket.disconnect();
         }
       });
+
+      // Admin sockets join the `admins` room for cross-cutting events like
+      // `lead.new` (landing form submissions) and `lead.updated`. Failure is
+      // silent — we don't disconnect since the same socket might be used by
+      // a tenant client that just hasn't sent `join_admin`.
+      socket.on('join_admin', (token) => {
+        try {
+          const decoded = jwt.verify(token, process.env.JWT_SECRET);
+          if (decoded.type === 'admin') socket.join('admins');
+        } catch {
+          // ignore — admin will fall back to the 60s poll in Layout
+        }
+      });
     });
   }
 

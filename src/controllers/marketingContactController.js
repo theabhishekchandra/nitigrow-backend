@@ -17,6 +17,44 @@ const checkRate = (ip) => {
   return true;
 };
 
+// Disposable / throw-away email providers — leads from these almost always
+// bounce or never reply. Reject outright with a clear message so a real user
+// who mistyped can correct it.
+const DISPOSABLE_DOMAINS = new Set([
+  'mailinator.com',
+  'tempmail.com',
+  'temp-mail.org',
+  '10minutemail.com',
+  'guerrillamail.com',
+  'guerrillamail.info',
+  'guerrillamail.biz',
+  'sharklasers.com',
+  'yopmail.com',
+  'throwawaymail.com',
+  'maildrop.cc',
+  'getnada.com',
+  'trashmail.com',
+  'dispostable.com',
+  'fakeinbox.com',
+  'mailcatch.com',
+  'tmpmail.net',
+  'mvrht.net',
+  'spam4.me',
+]);
+
+// Anti-bot timing window. Humans never fill a form in under 2s; bots do it in
+// <100ms. Anything older than a day is a stale cached session, also a tell.
+const MIN_FILL_MS = 2_000;
+const MAX_FILL_MS = 24 * 60 * 60 * 1000;
+
+// Silent-OK response — same shape as a real success so scrapers can't tell
+// when their submission was rejected by a trap and tune around it.
+const SILENT_OK = {
+  ok: true,
+  id: null,
+  message: "Thanks! We've got your note and will reply within an hour during business hours.",
+};
+
 // Best-effort email/Slack notification. Each channel is a no-op if its env
 // var isn't set — the submission still lands in Mongo for admin triage.
 const sendNotification = async (doc) => {
@@ -67,6 +105,23 @@ const submitContact = async (req, res) => {
 
     const { name, email, phone, businessName, topic, message } = req.body || {};
 
+    // Honeypot — the `website` input is rendered off-screen with autocomplete:off
+    // and tabindex:-1. Humans never see or fill it; bots that scrape every
+    // input always do. Return silent-OK to keep them from probing.
+    if (req.body.website) {
+      return res.status(200).json(SILENT_OK);
+    }
+
+    // Page-load timestamp — set by JS on form mount. If absent or out-of-window,
+    // it's either an automated agent or a stale tab; silent-OK either way.
+    const t = parseInt(req.body._t, 10);
+    if (t && Number.isFinite(t)) {
+      const elapsed = Date.now() - t;
+      if (elapsed < MIN_FILL_MS || elapsed > MAX_FILL_MS) {
+        return res.status(200).json(SILENT_OK);
+      }
+    }
+
     if (!name || typeof name !== 'string' || name.trim().length < 2) {
       return res.status(400).json({ error: 'Please provide your name.' });
     }
@@ -75,6 +130,11 @@ const submitContact = async (req, res) => {
     }
     if ((message || '').length > 4000) {
       return res.status(400).json({ error: 'Message is too long.' });
+    }
+
+    const domain = String(email).toLowerCase().split('@')[1];
+    if (domain && DISPOSABLE_DOMAINS.has(domain)) {
+      return res.status(400).json({ error: 'Please use a real business email so we can reply.' });
     }
 
     const doc = await ContactSubmission.create({
@@ -92,6 +152,20 @@ const submitContact = async (req, res) => {
     sendNotification(doc).catch((err) =>
       console.error('[Contact] notification failed:', err.message),
     );
+
+    // Live-push the new lead to any admin socket subscribed to the `admins`
+    // room. Falls back gracefully if io isn't bound (e.g. test env).
+    if (global.io) {
+      global.io.to('admins').emit('lead.new', {
+        id: doc._id,
+        name: doc.name,
+        businessName: doc.businessName,
+        email: doc.email,
+        topic: doc.topic,
+        message: (doc.message || '').slice(0, 90),
+        createdAt: doc.createdAt,
+      });
+    }
 
     res.status(201).json({
       ok: true,
@@ -132,6 +206,13 @@ const updateSubmission = async (req, res) => {
     if (notes !== undefined) update.notes = notes;
     const doc = await ContactSubmission.findByIdAndUpdate(req.params.id, update, { new: true });
     if (!doc) return res.status(404).json({ error: 'Not found' });
+
+    // Broadcast to other admin tabs so their inbox + bell update without a
+    // refresh. Best-effort: io may not be bound in tests.
+    if (global.io) {
+      global.io.to('admins').emit('lead.updated', { id: doc._id, status: doc.status });
+    }
+
     res.json({ data: doc });
   } catch (err) {
     res.status(500).json({ error: err.message });
